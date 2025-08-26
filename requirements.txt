@@ -1,0 +1,4 @@
+setuptools~=41.2.0
+Flask~=2.0.1
+kubernetes~=17.17.0
+werkzeug~=2.2.2

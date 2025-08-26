@@ -1,0 +1,15 @@
+image:
+  repository: quay.io/domino
+  container: ddl-cluster-scaler
+  appVersion: v1.0.0-release
+  pullPolicy: Always
+
+env:
+  name: ddl-cluster-scaler
+  service: ddl-cluster-scaler-svc
+  namespace:
+    field: domino-field
+    compute: domino-compute
+istio:
+  enabled: true
+

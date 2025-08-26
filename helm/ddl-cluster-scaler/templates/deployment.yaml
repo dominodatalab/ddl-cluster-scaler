@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "{{ .Values.env.name }}"
+  labels:
+    app: "{{ .Values.env.name }}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: "{{ .Values.env.name}}"
+  template:
+    metadata:
+      labels:
+        app: "{{ .Values.env.name }}"
+        nucleus-client: "true"
+    spec:
+      nodeSelector:
+        dominodatalab.com/node-pool: platform
+      serviceAccountName: "{{ .Values.env.name }}"
+      automountServiceAccountToken: true  
+      containers:
+      - name: "{{ .Values.env.name }}"
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - all
+        image: "{{ .Values.image.repository }}/{{ .Values.image.container }}:{{ .Values.image.appVersion }}"
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 6000
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 6000
+            scheme: HTTP
+          initialDelaySeconds: 20
+          failureThreshold: 2
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 6000
+            scheme: HTTP
+          initialDelaySeconds: 20
+          failureThreshold: 2
+          timeoutSeconds: 5
