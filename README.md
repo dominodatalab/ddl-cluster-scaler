@@ -22,14 +22,14 @@ helm install -f ./values.yaml ddl-cluster-scaler helm/ddl-cluster-scaler -n ${fi
 ```shell
 export field_namespace=domino-field
 
-helm upgrade -f ./values.yaml rayclusterscaler helm/rayclusterscaler -n ${field_namespace}
+helm upgrade -f ./values.yaml ddl-cluster-scaler helm/ddl-cluster-scaler -n ${field_namespace}
 ```
 
 ## Delete 
 
 ```shell
 export field_namespace=domino-field
-helm delete  rayclusterscaler -n ${field_namespace}
+helm delete  ddl-cluster-scaler -n ${field_namespace}
 ```
 
 ## Endpoints

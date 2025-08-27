@@ -197,13 +197,13 @@ def is_authorized_to_view_cluster(caller: UserIdentity, owner_id: Optional[str])
 
 # ---------- Routes ----------
 
-@ddl_cluster_scaler_api.get("/ddl_cluster_scaler_api/list/<kind>")
+@ddl_cluster_scaler_api.get("/ddl_cluster_scaler/list/<kind>")
 def list_clusters(kind: AllowedKind):
     """
     List clusters for the given CRD kind (plural): rayclusters|daskclusters|sparkclusters.
     Filters to those the caller can view.
     """
-    logger.warning("GET /ddl_cluster_scaler_api/list/%s", kind)
+    logger.warning("GET /ddl_cluster_scaler/list/%s", kind)
 
     allowed = {"rayclusters", "daskclusters", "sparkclusters"}
     if kind not in allowed:
@@ -243,7 +243,7 @@ def list_clusters(kind: AllowedKind):
         )
 
 
-@ddl_cluster_scaler_api.get("/cluster/<kind>/<name>")
+@ddl_cluster_scaler_api.get("/ddl_cluster_scaler/get/<kind>/<name>")
 def get_cluster(kind: AllowedKind, name: str) -> object:
     """
     Fetch a specific cluster by kind + name.
@@ -291,18 +291,15 @@ def get_cluster(kind: AllowedKind, name: str) -> object:
         )
 
 
-@ddl_cluster_scaler_api.post("/cluster/scale/<kind>")
-def scale_cluster(kind: AllowedKind) -> object:
+@ddl_cluster_scaler_api.post("/ddl_cluster_scaler/scale/<kind>/<name>")
+def scale_cluster(kind: AllowedKind, name: str) -> object:
     """
     Scale a cluster (kind in: rayclusters|daskclusters|sparkclusters).
 
     Body JSON:
-      {
-        "cluster_name": "<name>",
-        "replicas": <int>
-      }
+      { "replicas": <int> }   # may be 0; capped to maxReplicas; never increases maxReplicas
     """
-    logger.warning("POST /cluster/scale/%s", kind)
+    logger.warning("POST /ddl_cluster_scaler/scale/%s/%s", kind, name)
 
     allowed = {"rayclusters", "daskclusters", "sparkclusters"}
     if kind not in allowed:
@@ -313,14 +310,12 @@ def scale_cluster(kind: AllowedKind) -> object:
         )
 
     payload = request.get_json(silent=True) or {}
-    name = payload.get("cluster_name")
-    replicas = payload.get("replicas")
+    replicas_raw = payload.get("replicas")
 
-    if not name or not isinstance(name, str):
-        return (jsonify(error="bad_request", message="cluster_name is required"), 400, NO_CACHE)
+    # Validate input: allow 0; disallow negatives and non-ints
     try:
-        replicas = int(replicas)
-        if replicas < 0:
+        requested_replicas = int(replicas_raw)
+        if requested_replicas < 0:
             raise ValueError("replicas must be >= 0")
     except Exception:
         return (
@@ -330,6 +325,7 @@ def scale_cluster(kind: AllowedKind) -> object:
         )
 
     try:
+        # Fetch object
         obj: Dict[str, Any] = K8S_CUSTOM_OBJECTS.get_namespaced_custom_object(
             group=GROUP,
             version=VERSION,
@@ -338,9 +334,9 @@ def scale_cluster(kind: AllowedKind) -> object:
             name=name,
         )
 
+        # Auth
         labels = obj.get("metadata", {}).get("labels", {}) or {}
         owner_id = labels.get(LABEL_OWNER_ID)
-
         auth_headers = get_auth_headers(request.headers)
         caller = fetch_current_user(auth_headers)
         if not is_authorized_to_view_cluster(caller, owner_id):
@@ -350,8 +346,8 @@ def scale_cluster(kind: AllowedKind) -> object:
                 NO_CACHE,
             )
 
-        # Ensure autoscaling exists
-        spec = obj.setdefault("spec", {})
+        # Ensure autoscaling + valid maxReplicas
+        spec = obj.get("spec") or {}
         autoscaling = spec.get("autoscaling")
         if not isinstance(autoscaling, dict):
             return (
@@ -360,15 +356,25 @@ def scale_cluster(kind: AllowedKind) -> object:
                 NO_CACHE,
             )
 
-        # Update desired replicas (keep max >= min with at least +1 headroom)
-        current_max = autoscaling.get("maxReplicas", replicas + 1)
-        autoscaling["minReplicas"] = replicas
-        autoscaling["maxReplicas"] = max(replicas + 1, int(current_max))
+        try:
+            max_replicas = int(autoscaling.get("maxReplicas"))
+        except Exception:
+            return (
+                jsonify(
+                    error="invalid_autoscaling",
+                    message="Cannot scale: autoscaling.maxReplicas is missing or invalid",
+                ),
+                409,
+                NO_CACHE,
+            )
 
-        # Some CRDs keep a worker replica field too—update if present
-        worker = spec.get("worker")
-        if isinstance(worker, dict):
-            worker["replicas"] = replicas
+        # Cap to [0, maxReplicas]; allow 0 explicitly; DO NOT change maxReplicas
+        effective_replicas = min(max(requested_replicas, 0), max_replicas)
+
+        # Minimal strategic-merge patch: set minReplicas (and worker.replicas if present)
+        patch_body: Dict[str, Any] = {"spec": {"autoscaling": {"minReplicas": effective_replicas}}}
+        if isinstance(spec.get("worker"), dict):
+            patch_body["spec"]["worker"] = {"replicas": effective_replicas}
 
         patched = K8S_CUSTOM_OBJECTS.patch_namespaced_custom_object(
             group=GROUP,
@@ -376,10 +382,22 @@ def scale_cluster(kind: AllowedKind) -> object:
             namespace=COMPUTE_NAMESPACE,
             plural=kind,
             name=name,
-            body=obj,
+            body=patch_body,
         )
 
-        return (jsonify(kind=kind, name=name, replicas=replicas, object=patched), 200, NO_CACHE)
+        return (
+            jsonify(
+                kind=kind,
+                name=name,
+                requested_replicas=requested_replicas,
+                effective_replicas=effective_replicas,
+                maxReplicas=max_replicas,
+                capped=(requested_replicas > max_replicas),
+                object=patched,
+            ),
+            200,
+            NO_CACHE,
+        )
 
     except Exception as e:
         logger.exception("Failed to scale cluster kind=%s name=%s", kind, name)
