@@ -1,6 +1,5 @@
-# Ray Cluster Custom Scaler (Beta)
-This is a basic Ray Cluster Scaler
-
+# DDL Cluster Scaler (Beta)
+This is a basic DDL Cluster Scaler supporting Ray, Dask and Spark clusters.
 
 
 ## Installation
@@ -148,7 +147,7 @@ curl -sS \
 
 ### 3) Scale a cluster
 
-**POST** `/cluster/scale/{kind}`
+**POST** `/cluster/scale/{kind}/{name}`
 
 Update desired replicas. Requires CRD to expose spec.autoscaling.
 
@@ -158,11 +157,11 @@ Update desired replicas. Requires CRD to expose spec.autoscaling.
 #### Path parameters
 
 - kind — rayclusters|daskclusters|sparkclusters
+- name - cluster name (Kubernetes object name)
 
 **Request body (JSON)**
 ```json
 {
-  "cluster_name": "my-raycluster",
   "replicas": 3
 }
 ```
@@ -211,8 +210,8 @@ Update desired replicas. Requires CRD to expose spec.autoscaling.
 curl -sS -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"cluster_name":"my-raycluster","replicas":4}' \
-  "$BASE/cluster/scale/rayclusters"
+  -d '{"replicas":4}' \
+  "$BASE/cluster/scale/rayclusters/my-raycluster"
 ```
 
 ### Common response headers
