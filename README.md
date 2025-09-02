@@ -154,6 +154,13 @@ Update desired replicas. Requires CRD to expose spec.autoscaling.
 > If present, spec.worker.replicas is also updated.
 > Ensures spec.autoscaling.maxReplicas >= minReplicas with at least +1 headroom.
 
+Scaling a cluster allows you to configure `minReplicas==maxReplicas==replicas`. But the crucial value add provided
+by this endpoint is that it allows you to update the hardware tier of the worker nodes.
+
+> Domino does not permit you to scale the cluster down to `0` replicas. When using GPU hardware tier the workload incurs
+> GPU costs even when the cluster is idle. To avoid incurring unnecessary costs, scale down to `1` replica when the cluster
+> is not in use while selecting the smallest hardware tier.
+
 #### Path parameters
 
 - kind — rayclusters|daskclusters|sparkclusters
@@ -162,9 +169,12 @@ Update desired replicas. Requires CRD to expose spec.autoscaling.
 **Request body (JSON)**
 ```json
 {
+  "worker_hw_tier": "Medium",  
   "replicas": 3
 }
 ```
+
+
 
 ### Success response — 200
 
@@ -210,7 +220,7 @@ Update desired replicas. Requires CRD to expose spec.autoscaling.
 curl -sS -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"replicas":4}' \
+  -d '{"replicas":4, "worker_hw_tier": "small"}' \
   "$BASE/cluster/scale/rayclusters/my-raycluster"
 ```
 

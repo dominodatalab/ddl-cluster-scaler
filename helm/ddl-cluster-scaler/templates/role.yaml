@@ -8,8 +8,16 @@ rules:
   resources:
   - "rayclusters"
   - "sparkclusters"
+  - "daskclusters"
   verbs:
   - "*"
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/eviction"]
+  verbs: ["create"]
+
 ---
 kind: Role
 apiVersion: rbac.authorization.k8s.io/v1
@@ -22,5 +30,12 @@ rules:
   resources:
   - "rayclusters"
   - "sparkclusters"
+  - "daskclusters"
   verbs:
   - "*"
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/eviction"]
+  verbs: ["create"]

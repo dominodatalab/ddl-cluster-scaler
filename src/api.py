@@ -13,7 +13,7 @@ class Config:
     HOST: str = os.getenv("FLASK_HOST", "0.0.0.0")
     PORT: int = int(os.getenv("FLASK_PORT", "6000"))
     DEBUG: bool = os.getenv("FLASK_DEBUG", "0") in ("1", "true", "True")
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "WARNING")
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG")
 
 
 def _coerce_log_level(level_name: str) -> int:

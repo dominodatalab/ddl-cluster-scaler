@@ -18,11 +18,20 @@ from typing import Literal, Dict, Any, List, Final, Optional, Mapping
 # third-party
 from flask import Blueprint, jsonify, request
 from kubernetes import client, config
-from kubernetes.client import ApiClient, CustomObjectsApi
+from kubernetes.client import ApiClient, CustomObjectsApi, ApiException, CoreV1Api, V1DeleteOptions
 import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+from typing import Mapping
 
+try:
+    config.load_incluster_config()
+except config.ConfigException:
+    try:
+        config.load_kube_config()
+    except config.ConfigException:
+        raise Exception("Could not configure kubernetes python client")
+from datetime import datetime, timezone
 
 # ---------- Logging (configure once) ----------
 
@@ -31,7 +40,7 @@ def _coerce_log_level(name: str) -> int:
     return lvl if isinstance(lvl, int) else logging.WARNING
 
 
-LOG_LEVEL: Final[int] = _coerce_log_level(os.getenv("LOG_LEVEL", "WARNING"))
+LOG_LEVEL: Final[int] = _coerce_log_level(os.getenv("LOG_LEVEL", "INFO"))
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -59,7 +68,8 @@ COMPUTE_NAMESPACE: Final[str] = os.getenv("COMPUTE_NAMESPACE", DEFAULT_COMPUTE_N
 GROUP: Final[str] = "distributed-compute.dominodatalab.com"
 VERSION: Final[str] = "v1alpha1"
 
-DOMINO_NUCLEUS_URI_RAW = os.getenv("DOMINO_NUCLEUS_URI", "http://nucleus-frontend.domino-platform:80")
+#DOMINO_NUCLEUS_URI_RAW = os.getenv("DOMINO_NUCLEUS_URI", "http://nucleus-frontend.domino-platform:80")
+DOMINO_NUCLEUS_URI_RAW = os.getenv("DOMINO_NUCLEUS_URI", "https://marcdo77364.cs.domino.tech")
 DOMINO_NUCLEUS_URI: Final[str] = DOMINO_NUCLEUS_URI_RAW.rstrip("/")
 WHO_AM_I_ENDPOINT: Final[str] = "v4/auth/principal"
 
@@ -290,101 +300,275 @@ def get_cluster(kind: AllowedKind, name: str) -> object:
             NO_CACHE,
         )
 
+from typing import Mapping
 
+def get_hw_tiers(auth_headers: Dict[str, str], requested_hw_tier_id: str) -> Dict[str, Any]:
+    """
+    Fetch a single hardware tier by name from Domino Nucleus.
+    Returns the tier object dict, or {} if not found / error.
+    """
+    try:
+        # Expect caller to pass sanitized headers (Bearer or API key)
+        if not auth_headers.get("X-Domino-Api-Key") and not auth_headers.get("Authorization"):
+            logger.warning("No auth headers provided for HW TIERS call")
+            return {}
+
+        resp = domino_get("v4/hardwareTier", headers=auth_headers)
+        if resp.status_code != 200:
+            logger.warning("HW TIERS non-200 (%s): %s", resp.status_code, resp.text[:200])
+            return {}
+
+        payload: Dict[str, Any] = resp.json() if resp.content else {}
+        for item in payload.get("hardwareTiers", []):
+            if item.get("id") == requested_hw_tier_id:
+                logger.info("Fetched hardware tier: %s", requested_hw_tier_id)
+                return item
+
+        logger.warning("Requested hardware tier not found: %s", requested_hw_tier_id)
+        return {}
+
+    except Exception as e:
+        logger.exception("HW TIERS call failed: %s", e)
+        return {}
+
+def restart_head_pod(namespace: str, pod_name: str, *, grace_period_seconds: int = 20) -> Dict[str, Any]:
+    """
+    Initiate a restart of the head node by deleting its Pod.
+    This function does NOT wait for the replacement to come up.
+
+    Returns a small status dict; caller can log/inspect as needed.
+    """
+    v1: CoreV1Api = CoreV1Api(K8S_API_CLIENT)  # reuse your module-level ApiClient
+    try:
+        resp = v1.delete_namespaced_pod(
+            name=pod_name,
+            namespace=namespace,
+            body=V1DeleteOptions(grace_period_seconds=grace_period_seconds),
+        )
+        logger.warning("head_restart initiated ns=%s pod=%s grace=%s",
+                       namespace, pod_name, grace_period_seconds)
+        return {
+            "ok": True,
+            "namespace": namespace,
+            "pod": pod_name,
+            "grace_period_seconds": grace_period_seconds,
+            "k8s_status": getattr(resp, "status", None),
+            "k8s_details": getattr(resp, "details", None),
+        }
+    except ApiException as e:
+        # 404: already gone or wrong name/namespace
+        if e.status == 404:
+            logger.warning("head_restart not_found ns=%s pod=%s", namespace, pod_name)
+            return {"ok": False, "namespace": namespace, "pod": pod_name, "error": "NotFound", "status": 404}
+        logger.exception("head_restart api_error ns=%s pod=%s status=%s", namespace, pod_name, getattr(e, "status", None))
+        return {"ok": False, "namespace": namespace, "pod": pod_name, "error": str(e), "status": getattr(e, "status", None)}
+    except Exception as e:
+        logger.exception("head_restart unexpected_error ns=%s pod=%s", namespace, pod_name)
+        return {"ok": False, "namespace": namespace, "pod": pod_name, "error": str(e)}
+
+def get_head_node_name(name:str) -> str:
+    cluster_type = name.split("-")[0]
+    return f"{name}-{cluster_type}-head-0"
 @ddl_cluster_scaler_api.post("/ddl_cluster_scaler/scale/<kind>/<name>")
 def scale_cluster(kind: AllowedKind, name: str) -> object:
     """
     Scale a cluster (kind in: rayclusters|daskclusters|sparkclusters).
 
     Body JSON:
-      { "replicas": <int> }   # may be 0; capped to maxReplicas; never increases maxReplicas
+      {
+        "replicas": <int>,            # may be 0; capped to maxReplicas
+        "worker_hw_tier_id": "<name>"    # optional; validates restrictions and applies resources/labels if present
+      }
     """
     logger.warning("POST /ddl_cluster_scaler/scale/%s/%s", kind, name)
 
     allowed = {"rayclusters", "daskclusters", "sparkclusters"}
     if kind not in allowed:
-        return (
-            jsonify(error="invalid_kind", message=f"kind must be one of {sorted(allowed)}"),
-            400,
-            NO_CACHE,
-        )
+        return jsonify(error="invalid_kind", message=f"kind must be one of {sorted(allowed)}"), 400, NO_CACHE
 
     payload = request.get_json(silent=True) or {}
-    replicas_raw = payload.get("replicas")
+    logger.info("scale_cluster payload kind=%s name=%s payload_keys=%s",
+                 kind, name, list(payload.keys()))
 
-    # Validate input: allow 0; disallow negatives and non-ints
+    # replicas validation (allow 0)
     try:
-        requested_replicas = int(replicas_raw)
+        requested_replicas = int(payload.get("replicas"))
         if requested_replicas < 0:
-            raise ValueError("replicas must be >= 0")
+            raise ValueError
     except Exception:
-        return (
-            jsonify(error="bad_request", message="replicas must be a non-negative integer"),
-            400,
-            NO_CACHE,
-        )
+        logger.info("scale_cluster invalid_replicas kind=%s name=%s value=%r",
+                       kind, name, payload.get("replicas"))
+        return jsonify(error="bad_request", message="replicas must be a non-negative integer"), 400, NO_CACHE
 
     try:
         # Fetch object
         obj: Dict[str, Any] = K8S_CUSTOM_OBJECTS.get_namespaced_custom_object(
-            group=GROUP,
-            version=VERSION,
-            namespace=COMPUTE_NAMESPACE,
-            plural=kind,
-            name=name,
+            group=GROUP, version=VERSION, namespace=COMPUTE_NAMESPACE, plural=kind, name=name
         )
 
         # Auth
-        labels = obj.get("metadata", {}).get("labels", {}) or {}
+        labels = (obj.get("metadata") or {}).get("labels") or {}
         owner_id = labels.get(LABEL_OWNER_ID)
         auth_headers = get_auth_headers(request.headers)
         caller = fetch_current_user(auth_headers)
+        logger.info("authz_check kind=%s name=%s caller_admin=%s caller_id=%s owner_id=%s",
+                     kind, name, caller.is_admin, caller.canonical_id, owner_id)
         if not is_authorized_to_view_cluster(caller, owner_id):
-            return (
-                jsonify(error="unauthorized", message=f"Not authorized to update cluster {name}"),
-                403,
-                NO_CACHE,
-            )
+            logger.info("scale_cluster unauthorized kind=%s name=%s", kind, name)
+            return jsonify(error="unauthorized", message=f"Not authorized to update cluster {name}"), 403, NO_CACHE
 
-        # Ensure autoscaling + valid maxReplicas
+        # Autoscaling checks
         spec = obj.get("spec") or {}
         autoscaling = spec.get("autoscaling")
         if not isinstance(autoscaling, dict):
-            return (
-                jsonify(error="not_scalable", message="Cannot scale this cluster: autoscaling not enabled"),
-                409,
-                NO_CACHE,
-            )
+            logger.warning("scale_cluster not_scalable kind=%s name=%s reason=no_autoscaling", kind, name)
+            return jsonify(error="not_scalable", message="Cannot scale this cluster: autoscaling not enabled"), 409, NO_CACHE
 
         try:
             max_replicas = int(autoscaling.get("maxReplicas"))
         except Exception:
-            return (
-                jsonify(
-                    error="invalid_autoscaling",
-                    message="Cannot scale: autoscaling.maxReplicas is missing or invalid",
-                ),
-                409,
-                NO_CACHE,
-            )
+            logger.warning("scale_cluster invalid_autoscaling kind=%s name=%s maxReplicas=%r",
+                           kind, name, autoscaling.get("maxReplicas") if isinstance(autoscaling, dict) else None)
+            return jsonify(error="invalid_autoscaling", message="autoscaling.maxReplicas is missing or invalid"), 409, NO_CACHE
 
-        # Cap to [0, maxReplicas]; allow 0 explicitly; DO NOT change maxReplicas
+        # Cap to [0, maxReplicas]; do NOT change maxReplicas
         effective_replicas = min(max(requested_replicas, 0), max_replicas)
+        logger.info("replica_plan kind=%s name=%s requested=%d effective=%d max=%d",
+                    kind, name, requested_replicas, effective_replicas, max_replicas)
 
-        # Minimal strategic-merge patch: set minReplicas (and worker.replicas if present)
-        patch_body: Dict[str, Any] = {"spec": {"autoscaling": {"minReplicas": effective_replicas}}}
-        if isinstance(spec.get("worker"), dict):
-            patch_body["spec"]["worker"] = {"replicas": effective_replicas}
+        # Optional: apply worker hardware tier resources
+        worker_tier_id = payload.get("worker_hw_tier_id")
+        worker_tier: Dict[str, Any] = {}
+        hwt_resources: Dict[str, Any] = {}
+        gpu_configuration: Dict[str, Any] = {}
 
+        if worker_tier_id:
+            logger.info("hw_tier_requested kind=%s name=%s tier=%s",
+                        kind, name, worker_tier_id)
+            worker_tier = get_hw_tiers(auth_headers=auth_headers, requested_hw_tier_id=worker_tier_id)
+            if not worker_tier:
+                logger.warning("hw_tier_not_found kind=%s name=%s tier=%s",
+                               kind, name, worker_tier_id)
+                return jsonify(error="invalid_hw_tier", message=f"Hardware tier not found: {worker_tier_id}"), 400, NO_CACHE
+
+            # Validate restrictions: if any 'restrictTo*' is True, kind must match one of them.
+            ccr = worker_tier.get("computeClusterRestrictions") or {}
+            restrict_flags = {
+                "sparkclusters": bool(ccr.get("restrictToSpark", False)),
+                "rayclusters":   bool(ccr.get("restrictToRay",   False)),
+                "daskclusters":  bool(ccr.get("restrictToDask",  False)),
+                # note: if tier is MPI-only, this will reject all current kinds
+                "mpicluster":    bool(ccr.get("restrictToMpi",   False)),
+            }
+            logger.info("hw_tier_restrictions kind=%s name=%s tier=%s flags=%s",
+                         kind, name, worker_tier_id, restrict_flags)
+            if any(restrict_flags.values()) and not restrict_flags.get(kind, False):
+                allowed_kinds = [k for k, v in restrict_flags.items() if v]
+                logger.warning("hw_tier_restricted kind=%s name=%s tier=%s allowed=%s",
+                               kind, name, worker_tier_id, allowed_kinds)
+                return (
+                    jsonify(
+                        error="invalid_hw_tier",
+                        message=f"Hardware tier '{worker_tier_id}' is restricted to {allowed_kinds}",
+                    ),
+                    400,
+                    NO_CACHE,
+                )
+
+            # Extract resource hints from the tier (guard for missing keys)
+            nodepool = worker_tier.get("nodePool")
+            hwt_resources = worker_tier.get("hwtResources") or {}
+            gpu_configuration = (worker_tier.get("gpuConfiguration") or {}) if worker_tier else {}
+            logger.info("hw_tier_resources kind=%s name=%s tier=%s cores=%r coresLimit=%r mem=%r memLimit=%r gpus=%r",
+                        kind, name, worker_tier_id,
+                        hwt_resources.get("cores"),
+                        hwt_resources.get("coresLimit"),
+                        hwt_resources.get("memory"),
+                        hwt_resources.get("memoryLimit"),
+                        gpu_configuration.get("numberOfGpus") if isinstance(gpu_configuration, dict) else None)
+
+        # Build a minimal strategic-merge patch
+        #patch_body: Dict[str, Any] = {"spec": {"autoscaling": {"minReplicas": effective_replicas,"maxReplicas": effective_replicas}}}
+        patch_body: Dict[str, Any] = {
+            "spec": {"autoscaling": {"minReplicas": effective_replicas}}}
+
+        # If worker stanza exists, update it (replicas and optional resources/labels)
+        worker_spec = spec.get("worker")
+        if isinstance(worker_spec, dict):
+            worker_patch = patch_body["spec"].setdefault("worker", {})
+            worker_patch["replicas"] = effective_replicas
+
+            if worker_tier_id and worker_tier:
+                node_selector = worker_patch.setdefault("nodeSelector", {})
+                labels_patch    = worker_patch.setdefault("labels", {})
+                resources_patch = worker_patch.setdefault("resources", {})
+                limits_patch    = resources_patch.setdefault("limits", {})
+                requests_patch  = resources_patch.setdefault("requests", {})
+
+                # Label with the tier id (if present)
+                tier_id = worker_tier.get("id")
+                if tier_id:
+                    labels_patch["dominodatalab.com/hardware-tier-id"] = str(tier_id)
+                    node_selector["dominodatalab.com/node-pool"] = nodepool
+
+                # CPU (prefer explicit cores/coresLimit if provided)
+                cores = hwt_resources.get("cores")
+                cores_limit = hwt_resources.get("coresLimit")
+                if cores is not None:
+                    requests_patch["cpu"] = str(cores)
+                if cores_limit is not None:
+                    limits_patch["cpu"] = str(cores_limit)
+
+                # Memory helper
+                def _mem_to_qty(m: Optional[Dict[str, Any]]) -> Optional[str]:
+                    if not isinstance(m, dict):
+                        return None
+                    v = m.get("value")
+                    u = m.get("unit")
+                    if v is None or u is None:
+                        return None
+                    unit_abbrev = str(u).strip()[:2]  # e.g., "GiB" -> "Gi"
+                    return f"{v}{unit_abbrev}" if unit_abbrev else None
+
+                mem_req = _mem_to_qty(hwt_resources.get("memory"))
+                mem_lim = _mem_to_qty(hwt_resources.get("memoryLimit"))
+                if mem_req:
+                    requests_patch["memory"] = mem_req
+                if mem_lim:
+                    limits_patch["memory"] = mem_lim
+
+                # GPUs (nvidia.com/gpu expects an integer)
+                if isinstance(gpu_configuration, dict):
+                    count = gpu_configuration.get("numberOfGpus")
+                    if isinstance(count, int) and count >= 0:
+                        requests_patch["nvidia.com/gpu"] = count
+                        limits_patch["nvidia.com/gpu"] = count
+
+                logger.info("hw_tier_patch_applied kind=%s name=%s tier=%s "
+                            "cpu_req=%s cpu_lim=%s mem_req=%s mem_lim=%s gpus=%s label_id_set=%s",
+                            kind, name, worker_tier_id,
+                            requests_patch.get("cpu"), limits_patch.get("cpu"),
+                            requests_patch.get("memory"), limits_patch.get("memory"),
+                            requests_patch.get("nvidia.com/gpu"),
+                            "dominodatalab.com/hardware-tier-id" in labels_patch)
+
+        else:
+            if worker_tier_id:
+                logger.info("hw_tier_requested_but_no_worker_spec kind=%s name=%s tier=%s",
+                               kind, name, worker_tier_id)
+
+        # Apply the patch
+        logger.debug("k8s_patch kind=%s name=%s patch_keys=%s", kind, name, list(patch_body.get("spec", {}).keys()))
         patched = K8S_CUSTOM_OBJECTS.patch_namespaced_custom_object(
-            group=GROUP,
-            version=VERSION,
-            namespace=COMPUTE_NAMESPACE,
-            plural=kind,
-            name=name,
-            body=patch_body,
+            group=GROUP, version=VERSION, namespace=COMPUTE_NAMESPACE, plural=kind, name=name, body=patch_body
         )
+        logger.info("k8s_patch_success kind=%s name=%s requested=%d effective=%d max=%d tier=%s",
+                    kind, name, requested_replicas, effective_replicas, max_replicas, worker_tier_id or "None")
 
+        head_node_name = get_head_node_name(name)
+        head_restart_status: Dict[str, Any] = restart_head_pod(namespace=COMPUTE_NAMESPACE, pod_name=head_node_name)
+        logger.info("Initiated restart of the head node for  kind=%s name=%s",
+                    kind, name)
         return (
             jsonify(
                 kind=kind,
@@ -393,6 +577,7 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
                 effective_replicas=effective_replicas,
                 maxReplicas=max_replicas,
                 capped=(requested_replicas > max_replicas),
+                worker_hw_tier_id=worker_tier_id or None,
                 object=patched,
             ),
             200,
@@ -401,8 +586,79 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
 
     except Exception as e:
         logger.exception("Failed to scale cluster kind=%s name=%s", kind, name)
+        return jsonify(error="scale_failed", message=f"Failed to scale cluster {name}", details=str(e)), 500, NO_CACHE
+
+
+
+
+
+def _parse_started_at(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"  # make it ISO 8601 tz-aware
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def _is_ready(pod) -> bool:
+    conds = (pod.status and pod.status.conditions) or []
+    return any(c.type == "Ready" and c.status == "True" for c in conds)
+
+@ddl_cluster_scaler_api.get("/ddl_cluster_scaler/head/restart_status/<namespace>/<pod_name>")
+def head_restart_status(namespace: str, pod_name: str):
+    """
+    Did the head pod restart since the given timestamp?
+
+    Query params (required/optional):
+      started_at     REQUIRED ISO-8601 time (e.g., 2025-09-02T15:40:00Z)
+      require_ready  optional bool (default: true). If true, ok=true only if pod is Ready.
+    """
+    started_at_raw = request.args.get("started_at")
+    require_ready = (request.args.get("require_ready", "true").lower() in {"true", "1", "yes"})
+
+    started_at = _parse_started_at(started_at_raw)
+    if not started_at:
         return (
-            jsonify(error="scale_failed", message=f"Failed to scale cluster {name}", details=str(e)),
-            500,
+            jsonify(error="bad_request", message="started_at (ISO-8601) is required"),
+            400,
             NO_CACHE,
         )
+
+    try:
+        v1 = CoreV1Api(K8S_API_CLIENT)
+        pod = v1.read_namespaced_pod(pod_name, namespace)
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return (jsonify(ok=False, reason="head pod not found", namespace=namespace, pod=pod_name), 404, NO_CACHE)
+        logger.exception("head_restart_status k8s error ns=%s pod=%s", namespace, pod_name)
+        return (jsonify(error="k8s_error", status=e.status, message=str(e)), 500, NO_CACHE)
+    except Exception as e:
+        logger.exception("head_restart_status unexpected error ns=%s pod=%s", namespace, pod_name)
+        return (jsonify(error="unexpected_error", message=str(e)), 500, NO_CACHE)
+
+    cts = pod.metadata.creation_timestamp  # tz-aware
+    restarted = bool(cts and cts >= started_at)
+    ready_ok = _is_ready(pod) if require_ready else True
+    ok = restarted and ready_ok
+
+    return (
+        jsonify(
+            ok=ok,
+            restarted=restarted,
+            ready=ready_ok,
+            reason=None if ok else ("not_restarted" if not restarted else "not_ready"),
+            namespace=namespace,
+            pod=pod_name,
+            creationTimestamp=cts.isoformat() if cts else None,
+            started_at=started_at.isoformat(),
+            require_ready=require_ready,
+            evaluated_with="started_at",
+        ),
+        200,
+        NO_CACHE,
+    )
+
