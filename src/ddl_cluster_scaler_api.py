@@ -302,7 +302,7 @@ def get_cluster(kind: AllowedKind, name: str) -> object:
 
 from typing import Mapping
 
-def get_hw_tiers(auth_headers: Dict[str, str], requested_hw_tier_id: str) -> Dict[str, Any]:
+def get_hw_tiers(auth_headers: Dict[str, str], requested_hw_tier: str) -> Dict[str, Any]:
     """
     Fetch a single hardware tier by name from Domino Nucleus.
     Returns the tier object dict, or {} if not found / error.
@@ -320,25 +320,34 @@ def get_hw_tiers(auth_headers: Dict[str, str], requested_hw_tier_id: str) -> Dic
 
         payload: Dict[str, Any] = resp.json() if resp.content else {}
         for item in payload.get("hardwareTiers", []):
-            if item.get("id") == requested_hw_tier_id:
-                logger.info("Fetched hardware tier: %s", requested_hw_tier_id)
+            if item.get("name") == requested_hw_tier:
+                logger.info("Fetched hardware tier: %s", requested_hw_tier)
                 return item
 
-        logger.warning("Requested hardware tier not found: %s", requested_hw_tier_id)
+        logger.warning("Requested hardware tier not found: %s", requested_hw_tier)
         return {}
 
     except Exception as e:
         logger.exception("HW TIERS call failed: %s", e)
         return {}
 
-def restart_head_pod(namespace: str, pod_name: str, *, grace_period_seconds: int = 20) -> Dict[str, Any]:
+def get_head_node_name(name: str) -> str:
+    cluster_type = name.split("-")[0]
+    return f"{name}-{cluster_type}-head-0"
+
+@ddl_cluster_scaler_api.post("/ddl_cluster_scaler/restart-head/<kind>/<name>")
+def restart_head_pod(name: str) -> Dict[str, Any]:
     """
     Initiate a restart of the head node by deleting its Pod.
     This function does NOT wait for the replacement to come up.
 
     Returns a small status dict; caller can log/inspect as needed.
     """
+    pod_name = get_head_node_name(name)
+
     v1: CoreV1Api = CoreV1Api(K8S_API_CLIENT)  # reuse your module-level ApiClient
+    namespace = COMPUTE_NAMESPACE
+    grace_period_seconds = 20
     try:
         resp = v1.delete_namespaced_pod(
             name=pod_name,
@@ -366,9 +375,8 @@ def restart_head_pod(namespace: str, pod_name: str, *, grace_period_seconds: int
         logger.exception("head_restart unexpected_error ns=%s pod=%s", namespace, pod_name)
         return {"ok": False, "namespace": namespace, "pod": pod_name, "error": str(e)}
 
-def get_head_node_name(name:str) -> str:
-    cluster_type = name.split("-")[0]
-    return f"{name}-{cluster_type}-head-0"
+
+
 @ddl_cluster_scaler_api.post("/ddl_cluster_scaler/scale/<kind>/<name>")
 def scale_cluster(kind: AllowedKind, name: str) -> object:
     """
@@ -377,7 +385,7 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
     Body JSON:
       {
         "replicas": <int>,            # may be 0; capped to maxReplicas
-        "worker_hw_tier_id": "<name>"    # optional; validates restrictions and applies resources/labels if present
+        "worker_hw_tier_name": "<name>"    # optional; validates restrictions and applies resources/labels if present
       }
     """
     logger.warning("POST /ddl_cluster_scaler/scale/%s/%s", kind, name)
@@ -437,19 +445,19 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
                     kind, name, requested_replicas, effective_replicas, max_replicas)
 
         # Optional: apply worker hardware tier resources
-        worker_tier_id = payload.get("worker_hw_tier_id")
+        worker_tier_name = payload.get("worker_hw_tier_name")
         worker_tier: Dict[str, Any] = {}
         hwt_resources: Dict[str, Any] = {}
         gpu_configuration: Dict[str, Any] = {}
-
-        if worker_tier_id:
+        nodepool = ""
+        if worker_tier_name:
             logger.info("hw_tier_requested kind=%s name=%s tier=%s",
-                        kind, name, worker_tier_id)
-            worker_tier = get_hw_tiers(auth_headers=auth_headers, requested_hw_tier_id=worker_tier_id)
+                        kind, name, worker_tier_name)
+            worker_tier = get_hw_tiers(auth_headers=auth_headers, requested_hw_tier=worker_tier_name)
             if not worker_tier:
                 logger.warning("hw_tier_not_found kind=%s name=%s tier=%s",
-                               kind, name, worker_tier_id)
-                return jsonify(error="invalid_hw_tier", message=f"Hardware tier not found: {worker_tier_id}"), 400, NO_CACHE
+                               kind, name, worker_tier_name)
+                return jsonify(error="invalid_hw_tier", message=f"Hardware tier not found: {worker_tier_name}"), 400, NO_CACHE
 
             # Validate restrictions: if any 'restrictTo*' is True, kind must match one of them.
             ccr = worker_tier.get("computeClusterRestrictions") or {}
@@ -461,15 +469,15 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
                 "mpicluster":    bool(ccr.get("restrictToMpi",   False)),
             }
             logger.info("hw_tier_restrictions kind=%s name=%s tier=%s flags=%s",
-                         kind, name, worker_tier_id, restrict_flags)
+                         kind, name, worker_tier_name, restrict_flags)
             if any(restrict_flags.values()) and not restrict_flags.get(kind, False):
                 allowed_kinds = [k for k, v in restrict_flags.items() if v]
                 logger.warning("hw_tier_restricted kind=%s name=%s tier=%s allowed=%s",
-                               kind, name, worker_tier_id, allowed_kinds)
+                               kind, name, worker_tier_name, allowed_kinds)
                 return (
                     jsonify(
                         error="invalid_hw_tier",
-                        message=f"Hardware tier '{worker_tier_id}' is restricted to {allowed_kinds}",
+                        message=f"Hardware tier '{worker_tier_name}' is restricted to {allowed_kinds}",
                     ),
                     400,
                     NO_CACHE,
@@ -480,7 +488,7 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
             hwt_resources = worker_tier.get("hwtResources") or {}
             gpu_configuration = (worker_tier.get("gpuConfiguration") or {}) if worker_tier else {}
             logger.info("hw_tier_resources kind=%s name=%s tier=%s cores=%r coresLimit=%r mem=%r memLimit=%r gpus=%r",
-                        kind, name, worker_tier_id,
+                        kind, name, worker_tier_name,
                         hwt_resources.get("cores"),
                         hwt_resources.get("coresLimit"),
                         hwt_resources.get("memory"),
@@ -498,7 +506,7 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
             worker_patch = patch_body["spec"].setdefault("worker", {})
             worker_patch["replicas"] = effective_replicas
 
-            if worker_tier_id and worker_tier:
+            if worker_tier_name and worker_tier:
                 node_selector = worker_patch.setdefault("nodeSelector", {})
                 labels_patch    = worker_patch.setdefault("labels", {})
                 resources_patch = worker_patch.setdefault("resources", {})
@@ -546,16 +554,16 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
 
                 logger.info("hw_tier_patch_applied kind=%s name=%s tier=%s "
                             "cpu_req=%s cpu_lim=%s mem_req=%s mem_lim=%s gpus=%s label_id_set=%s",
-                            kind, name, worker_tier_id,
+                            kind, name, worker_tier,
                             requests_patch.get("cpu"), limits_patch.get("cpu"),
                             requests_patch.get("memory"), limits_patch.get("memory"),
                             requests_patch.get("nvidia.com/gpu"),
                             "dominodatalab.com/hardware-tier-id" in labels_patch)
 
         else:
-            if worker_tier_id:
+            if worker_tier:
                 logger.info("hw_tier_requested_but_no_worker_spec kind=%s name=%s tier=%s",
-                               kind, name, worker_tier_id)
+                               kind, name, worker_tier)
 
         # Apply the patch
         logger.debug("k8s_patch kind=%s name=%s patch_keys=%s", kind, name, list(patch_body.get("spec", {}).keys()))
@@ -563,10 +571,9 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
             group=GROUP, version=VERSION, namespace=COMPUTE_NAMESPACE, plural=kind, name=name, body=patch_body
         )
         logger.info("k8s_patch_success kind=%s name=%s requested=%d effective=%d max=%d tier=%s",
-                    kind, name, requested_replicas, effective_replicas, max_replicas, worker_tier_id or "None")
+                    kind, name, requested_replicas, effective_replicas, max_replicas, worker_tier or "None")
 
-        head_node_name = get_head_node_name(name)
-        head_restart_status: Dict[str, Any] = restart_head_pod(namespace=COMPUTE_NAMESPACE, pod_name=head_node_name)
+
         logger.info("Initiated restart of the head node for  kind=%s name=%s",
                     kind, name)
         return (
@@ -577,7 +584,7 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
                 effective_replicas=effective_replicas,
                 maxReplicas=max_replicas,
                 capped=(requested_replicas > max_replicas),
-                worker_hw_tier_id=worker_tier_id or None,
+                worker_hw_tier_id=worker_tier or None,
                 object=patched,
             ),
             200,

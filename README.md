@@ -169,7 +169,7 @@ by this endpoint is that it allows you to update the hardware tier of the worker
 **Request body (JSON)**
 ```json
 {
-  "worker_hw_tier": "Medium",  
+  "worker_hw_tier_name": "Medium",  
   "replicas": 3
 }
 ```
