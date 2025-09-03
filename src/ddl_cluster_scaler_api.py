@@ -253,7 +253,7 @@ def list_clusters(kind: AllowedKind):
         )
 
 
-@ddl_cluster_scaler_api.get("/ddl_cluster_scaler/get/<kind>/<name>")
+@ddl_cluster_scaler_api.get("/ddl_cluster_scaler/cluster/<kind>/<name>")
 def get_cluster(kind: AllowedKind, name: str) -> object:
     """
     Fetch a specific cluster by kind + name.
@@ -331,53 +331,67 @@ def get_hw_tiers(auth_headers: Dict[str, str], requested_hw_tier: str) -> Dict[s
         logger.exception("HW TIERS call failed: %s", e)
         return {}
 
-def get_head_node_name(name: str) -> str:
+def get_head_pod_name(name: str) -> str:
     cluster_type = name.split("-")[0]
     return f"{name}-{cluster_type}-head-0"
+def iso_utc_now() -> str:
+    # e.g. "2025-09-02T15:40:00Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-@ddl_cluster_scaler_api.post("/ddl_cluster_scaler/restart-head/<kind>/<name>")
-def restart_head_pod(name: str) -> Dict[str, Any]:
+
+
+@ddl_cluster_scaler_api.patch("/ddl_cluster_scaler/restart_head/<kind>/<name>")
+def restart_head_pod(kind: str, name: str):
     """
     Initiate a restart of the head node by deleting its Pod.
-    This function does NOT wait for the replacement to come up.
-
-    Returns a small status dict; caller can log/inspect as needed.
+    Does NOT wait for the replacement to come up.
     """
-    pod_name = get_head_node_name(name)
+    # validate kind if you want stricter guardrails
+    # if kind not in {"rayclusters", "sparkclusters", "daskclusters"}:
+    #     return jsonify(error="invalid_kind"), 400, NO_CACHE
 
-    v1: CoreV1Api = CoreV1Api(K8S_API_CLIENT)  # reuse your module-level ApiClient
     namespace = COMPUTE_NAMESPACE
+    pod_name = get_head_pod_name(name)  # use kind if your naming differs per CRD
     grace_period_seconds = 20
+    stamp = iso_utc_now()
+
+    v1 = CoreV1Api(K8S_API_CLIENT)
     try:
-        resp = v1.delete_namespaced_pod(
+        raw = v1.delete_namespaced_pod(
             name=pod_name,
             namespace=namespace,
             body=V1DeleteOptions(grace_period_seconds=grace_period_seconds),
         )
         logger.warning("head_restart initiated ns=%s pod=%s grace=%s",
                        namespace, pod_name, grace_period_seconds)
-        return {
-            "ok": True,
-            "namespace": namespace,
-            "pod": pod_name,
-            "grace_period_seconds": grace_period_seconds,
-            "k8s_status": getattr(resp, "status", None),
-            "k8s_details": getattr(resp, "details", None),
-        }
+        k8s_resp = K8S_API_CLIENT.sanitize_for_serialization(raw) if raw is not None else None
+        # (equivalently: raw.to_dict() if hasattr(raw, "to_dict") else None)
+
+        return (
+            jsonify({
+                "ok": True,
+                "namespace": namespace,
+                "pod": pod_name,
+                "grace_period_seconds": grace_period_seconds,
+                "started_at": stamp,
+                "k8s_response": k8s_resp,  # now JSON-safe
+            }),
+            202,
+            NO_CACHE,
+        )
+
     except ApiException as e:
-        # 404: already gone or wrong name/namespace
         if e.status == 404:
             logger.warning("head_restart not_found ns=%s pod=%s", namespace, pod_name)
-            return {"ok": False, "namespace": namespace, "pod": pod_name, "error": "NotFound", "status": 404}
-        logger.exception("head_restart api_error ns=%s pod=%s status=%s", namespace, pod_name, getattr(e, "status", None))
-        return {"ok": False, "namespace": namespace, "pod": pod_name, "error": str(e), "status": getattr(e, "status", None)}
+            return jsonify(ok=False, namespace=namespace, pod=pod_name, error="NotFound"), 404, NO_CACHE
+        logger.exception("head_restart api_error ns=%s pod=%s status=%s", namespace, pod_name, e.status)
+        return jsonify(ok=False, namespace=namespace, pod=pod_name, error=str(e), status=e.status), 500, NO_CACHE
     except Exception as e:
         logger.exception("head_restart unexpected_error ns=%s pod=%s", namespace, pod_name)
-        return {"ok": False, "namespace": namespace, "pod": pod_name, "error": str(e)}
+        return jsonify(ok=False, namespace=namespace, pod=pod_name, error=str(e)), 500, NO_CACHE
 
 
-
-@ddl_cluster_scaler_api.post("/ddl_cluster_scaler/scale/<kind>/<name>")
+@ddl_cluster_scaler_api.patch("/ddl_cluster_scaler/scale/<kind>/<name>")
 def scale_cluster(kind: AllowedKind, name: str) -> object:
     """
     Scale a cluster (kind in: rayclusters|daskclusters|sparkclusters).
@@ -597,14 +611,12 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
 
 
 
-
-
 def _parse_started_at(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
     s = s.strip()
     if s.endswith("Z"):
-        s = s[:-1] + "+00:00"  # make it ISO 8601 tz-aware
+        s = s[:-1] + "+00:00"  # ISO 8601 tz-aware
     try:
         dt = datetime.fromisoformat(s)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
@@ -615,57 +627,75 @@ def _is_ready(pod) -> bool:
     conds = (pod.status and pod.status.conditions) or []
     return any(c.type == "Ready" and c.status == "True" for c in conds)
 
-@ddl_cluster_scaler_api.get("/ddl_cluster_scaler/head/restart_status/<namespace>/<pod_name>")
-def head_restart_status(namespace: str, pod_name: str):
+@ddl_cluster_scaler_api.get("/ddl_cluster_scaler/restart_head_status/<kind>/<name>")
+def head_restart_status(kind: AllowedKind, name: str):
     """
-    Did the head pod restart since the given timestamp?
+    Did the head pod restart since the given timestamp AND is it Ready now?
 
-    Query params (required/optional):
-      started_at     REQUIRED ISO-8601 time (e.g., 2025-09-02T15:40:00Z)
-      require_ready  optional bool (default: true). If true, ok=true only if pod is Ready.
+    Query params:
+      started_at  REQUIRED ISO-8601 (e.g., 2025-09-02T15:40:00Z)
+
+    Note: require_ready is assumed True (not configurable).
     """
     started_at_raw = request.args.get("started_at")
-    require_ready = (request.args.get("require_ready", "true").lower() in {"true", "1", "yes"})
 
     started_at = _parse_started_at(started_at_raw)
+    pod_name = get_head_pod_name(name)
+    namespace = COMPUTE_NAMESPACE
     if not started_at:
-        return (
-            jsonify(error="bad_request", message="started_at (ISO-8601) is required"),
-            400,
-            NO_CACHE,
-        )
+        return jsonify(error="bad_request", message="started_at (ISO-8601) is required"), 400, NO_CACHE
 
     try:
         v1 = CoreV1Api(K8S_API_CLIENT)
         pod = v1.read_namespaced_pod(pod_name, namespace)
     except client.exceptions.ApiException as e:
         if e.status == 404:
-            return (jsonify(ok=False, reason="head pod not found", namespace=namespace, pod=pod_name), 404, NO_CACHE)
+            logger.warning("head_restart_status not_found ns=%s pod=%s", namespace, pod_name)
+            return jsonify(
+                restarted=False,
+                ready=False,
+                status="head_pod_not_found",
+                namespace=namespace,
+                pod=pod_name,
+                started_at=started_at.isoformat(),
+            ), 404, NO_CACHE
         logger.exception("head_restart_status k8s error ns=%s pod=%s", namespace, pod_name)
-        return (jsonify(error="k8s_error", status=e.status, message=str(e)), 500, NO_CACHE)
+        return jsonify(error="k8s_error", status=e.status, message=str(e)), 500, NO_CACHE
     except Exception as e:
         logger.exception("head_restart_status unexpected error ns=%s pod=%s", namespace, pod_name)
-        return (jsonify(error="unexpected_error", message=str(e)), 500, NO_CACHE)
+        return jsonify(error="unexpected_error", message=str(e)), 500, NO_CACHE
 
+    # Compare creation time to started_at (inclusive)
     cts = pod.metadata.creation_timestamp  # tz-aware
     restarted = bool(cts and cts >= started_at)
-    ready_ok = _is_ready(pod) if require_ready else True
-    ok = restarted and ready_ok
+
+    # Must be Ready (always enforced)
+    ready_now = _is_ready(pod)
+    ok = restarted and ready_now
+
+    status = (
+        "not_restarted" if not restarted
+        else ("restarted_and_ready" if ready_now else "restarted_but_not_ready")
+    )
+
+    logger.warning(
+        "head_restart_status ns=%s pod=%s restarted=%s ready=%s cts=%s started_at=%s status=%s",
+        namespace, pod_name, restarted, ready_now,
+        cts.isoformat() if cts else None, started_at.isoformat(), status
+    )
 
     return (
         jsonify(
-            ok=ok,
-            restarted=restarted,
-            ready=ready_ok,
-            reason=None if ok else ("not_restarted" if not restarted else "not_ready"),
+            ok=ok,                         # true only if restarted AND Ready
+            restarted=restarted,           # clear boolean
+            ready=ready_now,
+            status=status,
             namespace=namespace,
             pod=pod_name,
             creationTimestamp=cts.isoformat() if cts else None,
             started_at=started_at.isoformat(),
-            require_ready=require_ready,
             evaluated_with="started_at",
         ),
         200,
         NO_CACHE,
     )
-
