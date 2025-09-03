@@ -511,8 +511,12 @@ def scale_cluster(kind: AllowedKind, name: str) -> object:
 
         # Build a minimal strategic-merge patch
         #patch_body: Dict[str, Any] = {"spec": {"autoscaling": {"minReplicas": effective_replicas,"maxReplicas": effective_replicas}}}
+
+#        patch_body: Dict[str, Any] = {
+#            "spec": {"autoscaling": {"minReplicas": effective_replicas}}}
         patch_body: Dict[str, Any] = {
-            "spec": {"autoscaling": {"minReplicas": effective_replicas}}}
+            "spec": {}}
+
 
         # If worker stanza exists, update it (replicas and optional resources/labels)
         worker_spec = spec.get("worker")
