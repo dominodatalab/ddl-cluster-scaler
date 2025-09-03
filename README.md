@@ -45,37 +45,9 @@ capabilities for **Ray**, **Dask**, and **Spark** cluster CRDs on Kubernetes.
 
 ---
 
-## Installation
-Follow these instructions to install the Helm chart for this service
+## Installation and Testing
 
-
-### New Install
-If `domino-field` namespace is not present create using below command
-
-```shell
-kubectl create namespace domino-field
-kubectl label namespace domino-field  domino-compute=true
-kubectl label namespace domino-field  domino-platform=true
-```
-
-```shell
-export field_namespace=domino-field
-helm install -f ./values.yaml ddl-cluster-scaler helm/ddl-cluster-scaler -n ${field_namespace}
-```
-### Upgrade
-
-```shell
-export field_namespace=domino-field
-
-helm upgrade -f ./values.yaml ddl-cluster-scaler helm/ddl-cluster-scaler -n ${field_namespace}
-```
-
-### Delete 
-
-```shell
-export field_namespace=domino-field
-helm delete  ddl-cluster-scaler -n ${field_namespace}
-```
+Follow the instructions in [README_INSTALL_AND_TEST.md](./README_INSTALL_AND_TEST.md) to install the Helm chart for this service.
 
 
 ## Endpoints
