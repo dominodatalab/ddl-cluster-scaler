@@ -198,8 +198,8 @@ def is_scaling_complete(cluster_kind: str = "rayclusters") -> bool:
     try:
         # Defensive lookups
         spec = result.get("spec", {})
-        autoscaling = spec.get("autoscaling", {})
-        effective_replicas = int(autoscaling.get("minReplicas"))
+        worker = spec.get("worker", {})
+        effective_replicas = int(worker.get("replicas"))
 
         status = result.get("status", {})
         nodes = status.get("nodes", []) or []
